@@ -22,10 +22,6 @@ export const handleToolMenuClick = (
       if (setCircleTabletState) {
         setCircleTabletState({ active: false, centerId: null, center: null, radius: 150, isDraggingHandle: false, handlePos: null });
       }
-    } else if (toolId === '__popup__segment_fixed') {
-      if (setSegmentInput) {
-        setSegmentInput(prev => ({ ...prev, visible: true }));
-      }
     }
   } else if (toolId === '__action__insert_lens_converging') {
     onInsertConvergingLens?.();

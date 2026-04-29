@@ -60,7 +60,7 @@ import Papir from '../imports/Papir';
 
 // --- TYPY ---
 
-type ToolType = 'move' | 'point' | 'segment' | 'line' | 'lineDashed' | 'lineDashDot' | 'ray' | 'circle' | 'angle' | 'distance' | 'perpendicular' | 'pan' | 'paper' | 'freehand' | 'highlighter' | 'highlighterStraight' | 'eraser';
+type ToolType = 'move' | 'point' | 'segment' | 'line' | 'lineDashed' | 'lineDashDot' | 'ray' | 'circle' | 'angle' | 'distance' | 'perpendicular' | 'parallelAxis' | 'objectImagePlace' | 'pan' | 'paper' | 'freehand' | 'highlighter' | 'highlighterStraight' | 'eraser';
 
 type TracePoint = { x: number; y: number };
 
@@ -259,9 +259,12 @@ interface ObjectArrowEntity {
   height: number;
   head: number;
   pathIds: {
-    stem: string;
-    headLeft: string;
-    headRight: string;
+    /** New format: single path for the whole arrow */
+    arrow?: string;
+    /** Back-compat: old format used 3 separate paths */
+    stem?: string;
+    headLeft?: string;
+    headRight?: string;
   };
 }
 
@@ -422,6 +425,24 @@ const OPTICAL_AXIS_LINE_ID = 'optical-axis-line';
 const OPTICAL_AXIS_P1_ID = 'optical-axis-p1';
 const OPTICAL_AXIS_P2_ID = 'optical-axis-p2';
 const OPTICAL_AXIS_GRID_STEP = 50;
+
+const getObjectArrowHeadFromHeight = (height: number) => {
+  const h = Math.abs(height);
+  // Při výšce 2 dílky chceme head ~0.4 dílku, tj. 0.2 * height.
+  const target = h * 0.2;
+  const minHead = OPTICAL_AXIS_GRID_STEP * 0.18;
+  const maxHead = OPTICAL_AXIS_GRID_STEP * 0.9;
+  return Math.max(minHead, Math.min(maxHead, target));
+};
+
+const getObjectArrowPathIds = (o: ObjectArrowEntity): string[] => {
+  const ids: string[] = [];
+  if (o.pathIds.arrow) ids.push(o.pathIds.arrow);
+  if (o.pathIds.stem) ids.push(o.pathIds.stem);
+  if (o.pathIds.headLeft) ids.push(o.pathIds.headLeft);
+  if (o.pathIds.headRight) ids.push(o.pathIds.headRight);
+  return ids;
+};
 
 function getVisibleGridStepWorld(scale: number): number {
   let step = OPTICAL_AXIS_GRID_STEP;
@@ -795,7 +816,7 @@ export function FreeGeometryEditor({
     axisY: number;
     startHeight: number;
     head: number;
-    pathIds: { stem: string; headLeft: string; headRight: string };
+    pathIds: ObjectArrowEntity['pathIds'];
     snapshotByPathId: Record<string, { x: number; y: number }[]>;
   } | null>(null);
   const objectArrowDragRafRef = useRef<number | null>(null);
@@ -1517,7 +1538,7 @@ export function FreeGeometryEditor({
         { id: 'line', label: 'Přímka', icon: Minus },
         { id: 'ray', label: 'Polopřímka', icon: Minus },
         { id: 'perpendicular', label: 'Kolmice', icon: Minus },
-        { id: '__popup__segment_fixed', label: 'Úsečka o rozměru', icon: Ruler },
+        { id: 'parallelAxis', label: 'Rovnoběžka s osou', icon: Ruler },
         { id: 'lineDashed', label: 'Čárkovaná čára', icon: Icons.DashedLine },
         { id: 'lineDashDot', label: 'Čerchovaná čára', icon: Icons.DashDotLine }
       ]
@@ -1617,10 +1638,10 @@ export function FreeGeometryEditor({
       if ((e.key === 'Delete' || e.key === 'Backspace') && (selection || selectedShapeIds.length > 0 || selectedFreehandIds.length > 0)) {
         if (selectedFreehandIds.length > 0) {
           const idsToDelete = new Set(selectedFreehandIds);
-          // If deleting part of an object arrow, delete the whole arrow (all 3 paths).
-          const arrowToDelete = objectArrows.find((o) => Object.values(o.pathIds).some((id) => idsToDelete.has(id))) ?? null;
+          // If deleting part of an object arrow, delete the whole arrow.
+          const arrowToDelete = objectArrows.find((o) => getObjectArrowPathIds(o).some((id) => idsToDelete.has(id))) ?? null;
           if (arrowToDelete) {
-            Object.values(arrowToDelete.pathIds).forEach((id) => idsToDelete.add(id));
+            getObjectArrowPathIds(arrowToDelete).forEach((id) => idsToDelete.add(id));
             setObjectArrows((prev) => prev.filter((o) => o.id !== arrowToDelete.id));
             if (selectedObjectArrowId === arrowToDelete.id) setSelectedObjectArrowId(null);
           }
@@ -2445,37 +2466,49 @@ export function FreeGeometryEditor({
     const isArrowLikePath = (p: FreehandPath): boolean => {
       // For tasks loaded from snapshots, color/width might differ. Prefer geometric signature.
       if (p.isHighlight) return false;
-      // Object arrow is stored as straight 2-point paths.
-      if (p.points.length !== 2) return false;
       // Width is usually ~2.8; if missing, accept.
       if (typeof p.width === 'number' && (p.width < 2.0 || p.width > 4.0)) return false;
-      return true;
+      // Accept both old 2-point segments and the new 1-path polyline.
+      return p.points.length >= 2;
     };
 
-    // 2) Snapshot fallback: infer arrow tip from arrow-like 2-point paths.
-    // We look for a point that is a shared endpoint of >=3 such segments (stem + two head segments).
-    const eps = 1e-3;
+    // 2) Snapshot fallback:
+    // - old format: infer arrow tip from arrow-like 2-point paths (shared endpoint deg>=3).
+    // - new format: infer tip from polyline graph / repeated node (tip is usually repeated).
+    const eps = 0.25; // tolerate snapshot rounding / minor mismatches
     const keyOf = (p: { x: number; y: number }) => `${Math.round(p.x / eps) * eps},${Math.round(p.y / eps) * eps}`;
     const nodes = new Map<string, { pt: { x: number; y: number }; deg: number }>();
     const segs: Array<{ a: { x: number; y: number }; b: { x: number; y: number } }> = [];
+    const occ = new Map<string, { pt: { x: number; y: number }; count: number }>();
 
     for (const p of freehandPaths) {
       if (!isArrowLikePath(p)) continue;
-      const a = p.points[0];
-      const b = p.points[1];
-      segs.push({ a, b });
-      for (const pt of [a, b]) {
+      // Build graph from any polyline / segment.
+      for (let i = 0; i < p.points.length; i++) {
+        const pt = p.points[i];
         const k = keyOf(pt);
-        const cur = nodes.get(k);
-        if (cur) cur.deg += 1;
-        else nodes.set(k, { pt: { x: pt.x, y: pt.y }, deg: 1 });
+        const curOcc = occ.get(k);
+        if (curOcc) curOcc.count += 1;
+        else occ.set(k, { pt: { x: pt.x, y: pt.y }, count: 1 });
+      }
+      for (let i = 1; i < p.points.length; i++) {
+        const a = p.points[i - 1];
+        const b = p.points[i];
+        segs.push({ a, b });
+        for (const pt of [a, b]) {
+          const k = keyOf(pt);
+          const cur = nodes.get(k);
+          if (cur) cur.deg += 1;
+          else nodes.set(k, { pt: { x: pt.x, y: pt.y }, deg: 1 });
+        }
       }
     }
 
     // Prefer the "arrow tip" node: degree>=3 and has two short arms + one longer arm.
     const tipCandidates: { pt: { x: number; y: number }; score: number }[] = [];
     for (const n of nodes.values()) {
-      if (n.deg < 3) continue;
+      const repeated = (occ.get(keyOf(n.pt))?.count ?? 0) >= 2;
+      if (n.deg < 3 && !repeated) continue;
       const incident: number[] = [];
       for (const s of segs) {
         const ka = keyOf(s.a);
@@ -2485,7 +2518,7 @@ export function FreeGeometryEditor({
         const other = ka === kn ? s.b : s.a;
         incident.push(Math.hypot(other.x - n.pt.x, other.y - n.pt.y));
       }
-      if (incident.length < 3) continue;
+      if (incident.length < 2) continue;
       incident.sort((a, b) => a - b);
       const short1 = incident[0];
       const short2 = incident[1];
@@ -2493,7 +2526,7 @@ export function FreeGeometryEditor({
       // arrow has two similar short arms and one longer stem
       const shortSim = 1 - Math.min(1, Math.abs(short1 - short2) / Math.max(1e-6, Math.max(short1, short2)));
       const stemRatio = long / Math.max(1e-6, (short1 + short2) / 2);
-      const score = shortSim + Math.min(3, stemRatio) * 0.6;
+      const score = shortSim + Math.min(3, stemRatio) * 0.6 + (repeated ? 0.6 : 0);
       tipCandidates.push({ pt: n.pt, score });
     }
     tipCandidates.sort((a, b) => b.score - a.score);
@@ -2530,7 +2563,7 @@ export function FreeGeometryEditor({
     const getOpticsLinePathIds = (): string[] => {
       const ids: string[] = [];
       for (const lens of lenses) ids.push(lens.linePathIds.axis);
-      for (const o of objectArrows) ids.push(o.pathIds.stem, o.pathIds.headLeft, o.pathIds.headRight);
+      for (const o of objectArrows) ids.push(...getObjectArrowPathIds(o));
       return ids;
     };
     const lensSnapShapeIds = new Set(lenses.map((l) => l.snapShapeId));
@@ -2652,7 +2685,7 @@ export function FreeGeometryEditor({
     // Optics lines (lens axis + object/image arrow segments) participate in snapping/intersections.
     const opticsIds: string[] = [];
     for (const lens of lenses) opticsIds.push(lens.linePathIds.axis);
-    for (const o of objectArrows) opticsIds.push(o.pathIds.stem, o.pathIds.headLeft, o.pathIds.headRight);
+    for (const o of objectArrows) opticsIds.push(...getObjectArrowPathIds(o));
     if (opticsIds.length > 0) {
       const idSet = new Set(opticsIds);
       for (const p of freehandPaths) {
@@ -2903,6 +2936,56 @@ export function FreeGeometryEditor({
     const wx = (e.clientX - rect.left - offset.x) / scale;
     const wy = (e.clientY - rect.top - offset.y) / scale;
 
+    // Objekt/obraz: čekáme na klik, pak vložíme šipku s počátkem na optické ose.
+    if (activeTool === 'objectImagePlace') {
+      const axisY =
+        pointsStateRef.current.find((p) => p.id === OPTICAL_AXIS_P1_ID)?.y ??
+        getNearestVisibleGridLineWorldY(canvasSize.height, offset.y, scale);
+
+      const virtualSnap = getOpticsVirtualPointSnap(wx, wy, POINT_SNAP_PX);
+      const snapPos = virtualSnap ? null : getSnapPositionPreferPoint(wx, wy, POINT_SNAP_PX, undefined, true);
+      const rawX = virtualSnap ? virtualSnap.x : (snapPos ? snapPos.x : wx);
+
+      const len = OPTICAL_AXIS_GRID_STEP * 2;
+      const height = wy > axisY ? -len : len; // pod osou dolů, na/nahoru
+      const head = getObjectArrowHeadFromHeight(height);
+      const tipY = axisY - height;
+      const wingY = height >= 0 ? tipY + head : tipY - head;
+      const color = '#ef4444';
+      const width = 2.8;
+
+      const arrowPathId = crypto.randomUUID();
+      const arrowId = crypto.randomUUID();
+
+      const arrowPath: FreehandPath = {
+        id: arrowPathId,
+        points: [
+          { x: rawX, y: axisY },
+          { x: rawX, y: tipY },
+          { x: rawX - head, y: wingY },
+          { x: rawX, y: tipY },
+          { x: rawX + head, y: wingY },
+        ],
+        color,
+        width,
+      };
+
+      const obj: ObjectArrowEntity = {
+        id: arrowId,
+        baseX: rawX,
+        axisY,
+        height,
+        head,
+        pathIds: { arrow: arrowPathId },
+      };
+
+      setFreehandPaths((prev) => [...prev, arrowPath]);
+      setObjectArrows((prev) => [...prev, obj]);
+      setSelectedObjectArrowId(arrowId);
+      setActiveTool('move');
+      return;
+    }
+
     // Tablet touch: synchronní hover nad čárou v místě ťuku (stav hoveredShape z předchozího gesta by jinak vybral špatnou linku)
     const lineHoverForAnglePerp =
       fromTouchBridge && isTabletMode && (activeTool === 'angle' || activeTool === 'perpendicular')
@@ -3131,7 +3214,7 @@ export function FreeGeometryEditor({
             setSelectedLensId(clickedLens ? clickedLens.id : null);
             const clickedMirror = mirrors.find((m) => m.curvePathId === clickedFreehandId) ?? null;
             setSelectedMirrorId(clickedMirror ? clickedMirror.id : null);
-            const clickedObj = objectArrows.find((o) => Object.values(o.pathIds).includes(clickedFreehandId)) ?? null;
+            const clickedObj = objectArrows.find((o) => getObjectArrowPathIds(o).includes(clickedFreehandId)) ?? null;
             setSelectedObjectArrowId(clickedObj ? clickedObj.id : null);
             if (e.ctrlKey || e.metaKey) {
               setSelectedFreehandIds(prev =>
@@ -3144,12 +3227,12 @@ export function FreeGeometryEditor({
             }
             // Drag "Objekt/obraz" only horizontally along the optical axis.
             if (!e.ctrlKey && !e.metaKey) {
-              const clickedObj = objectArrows.find((o) => Object.values(o.pathIds).includes(clickedFreehandId)) ?? null;
+              const clickedObj = objectArrows.find((o) => getObjectArrowPathIds(o).includes(clickedFreehandId)) ?? null;
               if (clickedObj) {
                 const tip = { x: clickedObj.baseX, y: clickedObj.axisY - clickedObj.height };
                 const tipHitPx = 14 / scale;
                 const isTipHit = Math.hypot(wx - tip.x, wy - tip.y) <= tipHitPx;
-                const ids = Object.values(clickedObj.pathIds);
+                const ids = getObjectArrowPathIds(clickedObj);
                 const snap: Record<string, { x: number; y: number }[]> = {};
                 freehandPaths.forEach((p) => {
                   if (ids.includes(p.id)) snap[p.id] = p.points.map((pt) => ({ x: pt.x, y: pt.y }));
@@ -3413,6 +3496,61 @@ export function FreeGeometryEditor({
             clearSelectionAfterPlacement();
         }
       }
+      return;
+    }
+
+    // 3b. NÁSTROJ: Rovnoběžka s osou (vodorovná přímka přes zvolený bod)
+    if (activeTool === 'parallelAxis') {
+      // Snap: viditelné body + průsečíky; skryté konstrukční body ne.
+      const snapPos = getSnapPositionPreferPoint(wx, wy, LINE_SNAP_PX, undefined, true);
+      const lineSnap = snapPos ? null : snapToNearestShape(wx, wy, LINE_SNAP_PX);
+      const pX = snapPos ? snapPos.x : (lineSnap ? lineSnap.x : wx);
+      const pY = snapPos ? snapPos.y : (lineSnap ? lineSnap.y : wy);
+
+      // drawRuler kreslí fixně 800px dlouhé pravítko a kotví ho do p1.
+      // Pozor: obrázek se kreslí s X offsetem -40 (tj. -40..760), takže střed je na x=360 od p1.
+      const rulerCenterFromP1 = 360; // world px
+      const rulerHalfLen = 400; // jen pro definici směru (délka úsečky)
+      const rP1 = { x: pX - rulerCenterFromP1, y: pY };
+      const rP2 = { x: pX - rulerCenterFromP1 + 2 * rulerHalfLen, y: pY };
+
+      const newP1Id = crypto.randomUUID();
+      const newP2Id = crypto.randomUUID();
+
+      const newP1: GeoPoint = { id: newP1Id, x: pX, y: pY, label: '', hidden: true };
+      const newP2: GeoPoint = { id: newP2Id, x: pX + 100, y: pY, label: '', hidden: true };
+
+      setPoints((prev) => [...prev, newP1, newP2]);
+
+      const newLine: GeoShape = {
+        id: crypto.randomUUID(),
+        type: 'line',
+        label: getNextShapeLabel('line'),
+        points: [newP1Id, newP2Id],
+        definition: { p1Id: newP1Id, p2Id: newP2Id },
+      };
+
+      // Pravítko vodorovně (jako u kolmice)
+      pendingToolVisualizationRef.current = {
+        type: 'ruler',
+        p1: rP1,
+        p2: rP2,
+        angle: 0,
+      };
+
+      setShapes((prev) => [...prev, newLine]);
+      triggerEffect(pX, pY, '#3b82f6');
+      addConstructionStep(
+        'line',
+        `${newLine.label} ∥ osa`,
+        `${newLine.label} \\parallel \\text{osa}`,
+        `Rovnoběžka ${newLine.label} s optickou osou`,
+        [newLine.id],
+        `\\text{Rovnoběžka } ${latexIt(newLine.label)} \\text{ s optickou osou}`,
+      );
+
+      setActiveTool('move');
+      clearSelectionAfterPlacement();
       return;
     }
 
@@ -3876,11 +4014,12 @@ export function FreeGeometryEditor({
           const ddx = wx - current.startWx;
           const nextBaseX = current.mode === 'move_x' ? (current.startBaseX + ddx) : current.startBaseX;
           const nextHeight = current.mode === 'resize_y' ? (current.axisY - wy) : current.startHeight;
+          const nextHead = current.mode === 'resize_y' ? getObjectArrowHeadFromHeight(nextHeight) : current.head;
           const tipY = current.axisY - nextHeight;
-          const wingY = nextHeight >= 0 ? tipY + current.head : tipY - current.head;
+          const wingY = nextHeight >= 0 ? tipY + nextHead : tipY - nextHead;
 
           setObjectArrows((prev) => prev.map((o) => (
-            o.id === current.arrowId ? { ...o, baseX: nextBaseX, height: nextHeight } : o
+            o.id === current.arrowId ? { ...o, baseX: nextBaseX, height: nextHeight, head: nextHead } : o
           )));
 
           setFreehandPaths((prev) => prev.map((p) => {
@@ -3890,9 +4029,22 @@ export function FreeGeometryEditor({
               return { ...p, points: snap.map((pt) => ({ x: pt.x + ddx, y: pt.y })) };
             }
             // resize_y: rebuild geometry from stored ids (x fixed, tip moves in y)
-            if (p.id === current.pathIds.stem) return { ...p, points: [{ x: current.startBaseX, y: current.axisY }, { x: current.startBaseX, y: tipY }] };
-            if (p.id === current.pathIds.headLeft) return { ...p, points: [{ x: current.startBaseX, y: tipY }, { x: current.startBaseX - current.head, y: wingY }] };
-            if (p.id === current.pathIds.headRight) return { ...p, points: [{ x: current.startBaseX, y: tipY }, { x: current.startBaseX + current.head, y: wingY }] };
+            if (current.pathIds.arrow && p.id === current.pathIds.arrow) {
+              return {
+                ...p,
+                points: [
+                  { x: current.startBaseX, y: current.axisY },
+                  { x: current.startBaseX, y: tipY },
+                  { x: current.startBaseX - nextHead, y: wingY },
+                  { x: current.startBaseX, y: tipY },
+                  { x: current.startBaseX + nextHead, y: wingY },
+                ],
+              };
+            }
+            // Back-compat: old 3-path arrows
+            if (current.pathIds.stem && p.id === current.pathIds.stem) return { ...p, points: [{ x: current.startBaseX, y: current.axisY }, { x: current.startBaseX, y: tipY }] };
+            if (current.pathIds.headLeft && p.id === current.pathIds.headLeft) return { ...p, points: [{ x: current.startBaseX, y: tipY }, { x: current.startBaseX - nextHead, y: wingY }] };
+            if (current.pathIds.headRight && p.id === current.pathIds.headRight) return { ...p, points: [{ x: current.startBaseX, y: tipY }, { x: current.startBaseX + nextHead, y: wingY }] };
             return p;
           }));
         });
@@ -3990,7 +4142,7 @@ export function FreeGeometryEditor({
       const clickedFreehandId = getFreehandPathAtPoint(wx, wy);
       const hoveredObj =
         clickedFreehandId
-          ? (objectArrows.find((o) => Object.values(o.pathIds).includes(clickedFreehandId)) ?? null)
+          ? (objectArrows.find((o) => getObjectArrowPathIds(o).includes(clickedFreehandId)) ?? null)
           : null;
       setHoveredObjectArrowId(hoveredObj ? hoveredObj.id : null);
     } else if (activeTool !== 'move') {
@@ -5417,9 +5569,7 @@ export function FreeGeometryEditor({
 
     const objectArrowPathIds = new Set<string>();
     for (const o of objectArrows) {
-      objectArrowPathIds.add(o.pathIds.stem);
-      objectArrowPathIds.add(o.pathIds.headLeft);
-      objectArrowPathIds.add(o.pathIds.headRight);
+      getObjectArrowPathIds(o).forEach((id) => objectArrowPathIds.add(id));
     }
 
     // 0a. Zvýrazňovač (highlighter) - pod vším ostatním
@@ -5951,7 +6101,7 @@ export function FreeGeometryEditor({
     if (activeTool === 'move' && hoveredObjectArrowId && hoveredObjectArrowId !== selectedObjectArrowId) {
       const o = objectArrows.find((x) => x.id === hoveredObjectArrowId) ?? null;
       if (o) {
-        const ids = new Set(Object.values(o.pathIds));
+        const ids = new Set(getObjectArrowPathIds(o));
         ctx.save();
         const hoverColor = darkMode ? '#fb7185' : '#ef4444';
         ctx.globalAlpha = 0.55;
@@ -6557,6 +6707,85 @@ export function FreeGeometryEditor({
     }
 
     // 4b. Náhled při tvorbě (ghost line) — mousePosRef se na tabletu nastaví i v handleTouchStart před mousedown
+    // 4b-0. „Rovnoběžka s osou“: náhled pravítka už před klikem (bez selectedPointId)
+    if (
+      activeTool === 'parallelAxis' &&
+      !isTabletMode &&
+      !animState.isActive &&
+      mousePosRef.current &&
+      !circleInput.visible
+    ) {
+      const mp = mousePosRef.current;
+      const snapPos = getSnapPositionPreferPoint(mp.x, mp.y, LINE_SNAP_PX, undefined, true);
+      const lineSnap = snapPos ? null : snapToNearestShape(mp.x, mp.y, LINE_SNAP_PX);
+      const pX = snapPos ? snapPos.x : (lineSnap ? lineSnap.x : mp.x);
+      const pY = snapPos ? snapPos.y : (lineSnap ? lineSnap.y : mp.y);
+
+      // drawRuler má fixní délku 800px a kreslí od -40..760, takže střed je na x=360 od p1.
+      const rulerCenterFromP1 = 360;
+      const rulerHalfLen = 400;
+      const p1 = { x: pX - rulerCenterFromP1, y: pY };
+      const p2 = { x: pX - rulerCenterFromP1 + 2 * rulerHalfLen, y: pY };
+
+      ctx.save();
+      ctx.globalAlpha = 0.6;
+      drawRuler(ctx, p1, p2, 0.5);
+
+      const ghostColor = darkMode ? 'rgba(255, 255, 255, 0.65)' : 'rgba(0, 0, 0, 0.55)';
+      ctx.beginPath();
+      ctx.moveTo(p1.x - 2000, p1.y);
+      ctx.lineTo(p1.x + 2000, p1.y);
+      ctx.strokeStyle = ghostColor;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 4b-0b. „Objekt/obraz“: náhled šipky před klikem (base vždy na ose, směr podle kurzoru)
+    if (
+      activeTool === 'objectImagePlace' &&
+      !isTabletMode &&
+      !animState.isActive &&
+      mousePosRef.current &&
+      !circleInput.visible
+    ) {
+      const mp = mousePosRef.current;
+      const axisY =
+        pointsStateRef.current.find((p) => p.id === OPTICAL_AXIS_P1_ID)?.y ??
+        getNearestVisibleGridLineWorldY(canvasSize.height, offset.y, scale);
+
+      const virtualSnap = getOpticsVirtualPointSnap(mp.x, mp.y, POINT_SNAP_PX);
+      const snapPos = virtualSnap ? null : getSnapPositionPreferPoint(mp.x, mp.y, POINT_SNAP_PX, undefined, true);
+      const x = virtualSnap ? virtualSnap.x : (snapPos ? snapPos.x : mp.x);
+
+      const len = OPTICAL_AXIS_GRID_STEP * 2;
+      const height = mp.y > axisY ? -len : len;
+      const head = getObjectArrowHeadFromHeight(height);
+      const tipY = axisY - height;
+      const wingY = height >= 0 ? tipY + head : tipY - head;
+
+      const pts = [
+        { x, y: axisY },
+        { x, y: tipY },
+        { x: x - head, y: wingY },
+        { x, y: tipY },
+        { x: x + head, y: wingY },
+      ];
+
+      ctx.save();
+      const ghostColor = darkMode ? 'rgba(251, 113, 133, 0.85)' : 'rgba(239, 68, 68, 0.85)';
+      ctx.globalAlpha = 0.65;
+      ctx.strokeStyle = ghostColor;
+      ctx.lineWidth = 3.2;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
     if (selectedPointId && !animState.isActive && mousePosRef.current && !circleInput.visible) {
       const p1 = points.find(p => p.id === selectedPointId);
       // Pokud hoverujeme nad bodem, použijeme ten bod jako cíl (snapping), jinak mousePos
@@ -7730,8 +7959,8 @@ export function FreeGeometryEditor({
     const arrowSize = 18;
     const color = '#3b82f6';
     const width = 2.8;
-    const focalDistance = OPTICAL_AXIS_GRID_STEP * 4;
-    const doubleFocalDistance = OPTICAL_AXIS_GRID_STEP * 8;
+    const focalDistance = OPTICAL_AXIS_GRID_STEP * 3;
+    const doubleFocalDistance = OPTICAL_AXIS_GRID_STEP * 6;
     const lensId = crypto.randomUUID();
     const axisPathId = crypto.randomUUID();
     const topLeftPathId = crypto.randomUUID();
@@ -7865,7 +8094,7 @@ export function FreeGeometryEditor({
     const sampleCount = 28;
     const points: { x: number; y: number }[] = [];
     const curvePathId = crypto.randomUUID();
-    const focalDistance = OPTICAL_AXIS_GRID_STEP * 4;
+    const focalDistance = OPTICAL_AXIS_GRID_STEP * 2;
     const leftFId = crypto.randomUUID();
     const left2FId = crypto.randomUUID();
     const rightFId = crypto.randomUUID();
@@ -7915,156 +8144,52 @@ export function FreeGeometryEditor({
   }, [canvasSize.height, canvasSize.width, freehandPaths, lenses.length, mirrors.length, offset.x, offset.y, scale]);
 
   const insertObjectImageArrow = useCallback(() => {
-    const lens = lenses[0] ?? null;
-    const mirror = mirrors[0] ?? null;
-    const axisY =
-      pointsStateRef.current.find((p) => p.id === OPTICAL_AXIS_P1_ID)?.y ??
-      getNearestVisibleGridLineWorldY(canvasSize.height, offset.y, scale);
-
-    const inferOpticsFromCanvas = (): { baseX: number; focalDistance: number } | null => {
-      const pts = pointsStateRef.current;
-      const fh = freehandPathsStateRef.current;
-      // 0) Prefer inference from labeled F/F' points (robust for shared snapshots)
-      const yTol = OPTICAL_AXIS_GRID_STEP * 0.6;
-      const byLabel = (wanted: string): GeoPoint[] =>
-        pts.filter((p) => String(p.label ?? '').trim() === wanted && Math.abs(p.y - axisY) <= yTol);
-
-      const fL = byLabel("F'");
-      const fR = byLabel('F');
-      const twoFL = byLabel("2F'");
-      const twoFR = byLabel('2F');
-
-      const pickClosestPair = (a: GeoPoint[], b: GeoPoint[]): { ax: number; bx: number } | null => {
-        if (a.length === 0 || b.length === 0) return null;
-        let best: { ax: number; bx: number; d: number } | null = null;
-        for (const pa of a) {
-          for (const pb of b) {
-            const d = Math.abs(pb.x - pa.x);
-            if (!best || d < best.d) best = { ax: pa.x, bx: pb.x, d };
-          }
-        }
-        return best ? { ax: best.ax, bx: best.bx } : null;
-      };
-
-      const pairF = pickClosestPair(fL, fR);
-      if (pairF) {
-        const baseX = (pairF.ax + pairF.bx) / 2;
-        const focalDistance = Math.abs(pairF.bx - baseX);
-        if (Number.isFinite(focalDistance) && focalDistance > 0) return { baseX, focalDistance };
-      }
-
-      const pair2F = pickClosestPair(twoFL, twoFR);
-      if (pair2F) {
-        const baseX = (pair2F.ax + pair2F.bx) / 2;
-        const focalDistance = Math.abs(pair2F.bx - baseX) / 2;
-        if (Number.isFinite(focalDistance) && focalDistance > 0) return { baseX, focalDistance };
-      }
-
-      // 1) Infer baseX from a lens axis (vertical 2-point freehand) or mirror curve (multi-point freehand)
-      let baseX: number | null = null;
-
-      const candidates2pt = fh.filter((p) => p.points.length === 2 && !p.isHighlight);
-      // Lens axis is a vertical 2-point line with significant height.
-      for (const p of candidates2pt) {
-        const a = p.points[0];
-        const b = p.points[1];
-        const dx = Math.abs(a.x - b.x);
-        const dy = Math.abs(a.y - b.y);
-        if (dx <= 2 / scale && dy >= OPTICAL_AXIS_GRID_STEP * 4) {
-          baseX = (a.x + b.x) / 2;
-          break;
-        }
-      }
-      // Mirror curve: polyline with many points, take x at y closest to axis
-      if (baseX == null) {
-        const curves = fh.filter((p) => !p.isHighlight && p.points.length >= 10);
-        for (const c of curves) {
-          let best = c.points[0];
-          let bestDy = Math.abs(best.y - axisY);
-          for (const pt of c.points) {
-            const ddy = Math.abs(pt.y - axisY);
-            if (ddy < bestDy) {
-              bestDy = ddy;
-              best = pt;
-            }
-          }
-          // Accept if curve comes near the axis
-          if (bestDy <= OPTICAL_AXIS_GRID_STEP * 0.6) {
-            baseX = best.x;
-            break;
-          }
-        }
-      }
-      if (baseX == null) return null;
-
-      // 2) Infer focal distance from labeled points F/2F on the optical axis.
-      const fs: number[] = [];
-      const twos: number[] = [];
-      for (const p of pts) {
-        const label = String(p.label ?? '').trim();
-        if (!label) continue;
-        if (Math.abs(p.y - axisY) > yTol) continue;
-        if (label === 'F' || label === "F'") fs.push(Math.abs(p.x - baseX));
-        if (label === '2F' || label === "2F'") twos.push(Math.abs(p.x - baseX));
-      }
-      let focalDistance: number | null = null;
-      if (fs.length > 0) focalDistance = Math.min(...fs);
-      else if (twos.length > 0) focalDistance = Math.min(...twos) / 2;
-      if (focalDistance == null || !Number.isFinite(focalDistance) || focalDistance <= 0) return null;
-      return { baseX, focalDistance };
-    };
-
-    const inferred = (!lens && !mirror) ? inferOpticsFromCanvas() : null;
-
-    const baseX =
-      (lens ? lens.centerX : (mirror ? mirror.vertexX : (inferred ? inferred.baseX : null)));
-    const focalDistance =
-      (lens ? lens.focalDistance : (mirror ? mirror.focalDistance : (inferred ? inferred.focalDistance : null)));
-
-    if (baseX == null || focalDistance == null) {
-      toast.message('Nejdřív vlož čočku nebo zrcadlo.');
-      return;
-    }
-
-    const x = baseX - 2 * focalDistance; // 2F' (levá strana)
-    const len = OPTICAL_AXIS_GRID_STEP * 2; // 2 dílky
-    const head = OPTICAL_AXIS_GRID_STEP * 0.4;
-    const y0 = axisY;
-    const y1 = axisY - len;
-    const color = '#ef4444';
-    const width = 2.8;
-
-    const stemId = crypto.randomUUID();
-    const headLeftId = crypto.randomUUID();
-    const headRightId = crypto.randomUUID();
-    const arrowId = crypto.randomUUID();
-
-    const arrowPaths: FreehandPath[] = [
-      { id: stemId, points: [{ x, y: y0 }, { x, y: y1 }], color, width },
-      { id: headLeftId, points: [{ x, y: y1 }, { x: x - head, y: y1 + head }], color, width },
-      { id: headRightId, points: [{ x, y: y1 }, { x: x + head, y: y1 + head }], color, width },
-    ];
-
-    const obj: ObjectArrowEntity = {
-      id: arrowId,
-      baseX: x,
-      axisY,
-      height: len,
-      head,
-      pathIds: { stem: stemId, headLeft: headLeftId, headRight: headRightId },
-    };
-
-    setFreehandPaths((prev) => [...prev, ...arrowPaths]);
-    setObjectArrows((prev) => [...prev, obj]);
-    setSelectedObjectArrowId(arrowId);
+    // New workflow: wait for click on canvas, then place arrow.
+    setSelectedObjectArrowId(null);
     setSelection(null);
     setSelectedShapeIds([]);
     setSelectedPointId(null);
     setSelectedFreehandIds([]);
     setSelectedLensId(null);
     setSelectedMirrorId(null);
-    setActiveTool('move');
-  }, [canvasSize.height, lenses, mirrors, offset.y, scale]);
+    setActiveTool('objectImagePlace');
+  }, []);
+
+  const updateObjectArrowGeometry = useCallback((arrowId: string, next: { baseX?: number; height?: number }) => {
+    const current = objectArrows.find((o) => o.id === arrowId);
+    if (!current) return;
+
+    const baseX = next.baseX ?? current.baseX;
+    const height = next.height ?? current.height;
+    const head = getObjectArrowHeadFromHeight(height);
+    const tipY = current.axisY - height;
+    const wingY = height >= 0 ? tipY + head : tipY - head;
+
+    setObjectArrows((prev) => prev.map((o) => (
+      o.id === arrowId ? { ...o, baseX, height, head } : o
+    )));
+
+    setFreehandPaths((prev) => prev.map((p) => {
+      // New 1-path arrow
+      if (current.pathIds.arrow && p.id === current.pathIds.arrow) {
+        return {
+          ...p,
+          points: [
+            { x: baseX, y: current.axisY },
+            { x: baseX, y: tipY },
+            { x: baseX - head, y: wingY },
+            { x: baseX, y: tipY },
+            { x: baseX + head, y: wingY },
+          ],
+        };
+      }
+      // Back-compat: old 3-path arrows
+      if (current.pathIds.stem && p.id === current.pathIds.stem) return { ...p, points: [{ x: baseX, y: current.axisY }, { x: baseX, y: tipY }] };
+      if (current.pathIds.headLeft && p.id === current.pathIds.headLeft) return { ...p, points: [{ x: baseX, y: tipY }, { x: baseX - head, y: wingY }] };
+      if (current.pathIds.headRight && p.id === current.pathIds.headRight) return { ...p, points: [{ x: baseX, y: tipY }, { x: baseX + head, y: wingY }] };
+      return p;
+    }));
+  }, [objectArrows]);
 
   const updateLensFocalDistance = useCallback((lensId: string, nextFocalDistance: number) => {
     const minFocal = OPTICAL_AXIS_GRID_STEP;
@@ -8868,9 +8993,9 @@ export function FreeGeometryEditor({
                  onClick={() => {
                    if (selectedFreehandIds.length > 0) {
                      const idsToDelete = new Set(selectedFreehandIds);
-                     const arrowToDelete = objectArrows.find((o) => Object.values(o.pathIds).some((id) => idsToDelete.has(id))) ?? null;
+                    const arrowToDelete = objectArrows.find((o) => getObjectArrowPathIds(o).some((id) => idsToDelete.has(id))) ?? null;
                      if (arrowToDelete) {
-                       Object.values(arrowToDelete.pathIds).forEach((id) => idsToDelete.add(id));
+                      getObjectArrowPathIds(arrowToDelete).forEach((id) => idsToDelete.add(id));
                        setObjectArrows((prev) => prev.filter((o) => o.id !== arrowToDelete.id));
                        if (selectedObjectArrowId === arrowToDelete.id) setSelectedObjectArrowId(null);
                      }
@@ -8887,9 +9012,9 @@ export function FreeGeometryEditor({
                    e.stopPropagation();
                    if (selectedFreehandIds.length > 0) {
                      const idsToDelete = new Set(selectedFreehandIds);
-                     const arrowToDelete = objectArrows.find((o) => Object.values(o.pathIds).some((id) => idsToDelete.has(id))) ?? null;
+                    const arrowToDelete = objectArrows.find((o) => getObjectArrowPathIds(o).some((id) => idsToDelete.has(id))) ?? null;
                      if (arrowToDelete) {
-                       Object.values(arrowToDelete.pathIds).forEach((id) => idsToDelete.add(id));
+                      getObjectArrowPathIds(arrowToDelete).forEach((id) => idsToDelete.add(id));
                        setObjectArrows((prev) => prev.filter((o) => o.id !== arrowToDelete.id));
                        if (selectedObjectArrowId === arrowToDelete.id) setSelectedObjectArrowId(null);
                      }
@@ -8963,6 +9088,59 @@ export function FreeGeometryEditor({
               updateMirrorFocalDistance(selectedMirror.id, nextCm * OPTICAL_AXIS_GRID_STEP);
             }}
           />
+        </div>
+      )}
+
+      {/* Object/image arrow sliders (position + height) */}
+      {!recordingState.showPlayer && !selectedLens && !selectedMirror && selectedObjectArrow && (
+        <div
+          className={`absolute left-1/2 -translate-x-1/2 z-20 rounded-2xl px-4 py-3 shadow-lg border ${
+            darkMode ? 'bg-[#24283b]/95 border-[#565f89] text-[#c0caf5]' : 'bg-white/95 border-gray-200 text-gray-700'
+          }`}
+          style={{ bottom: 'calc(24px + env(safe-area-inset-bottom, 0px))', minWidth: 320 }}
+        >
+          {(() => {
+            const leftWorld = (0 - offset.x) / scale;
+            const rightWorld = (canvasSize.width - offset.x) / scale;
+            const pad = OPTICAL_AXIS_GRID_STEP * 2;
+            const minXcm = (leftWorld - pad) / PIXELS_PER_CM;
+            const maxXcm = (rightWorld + pad) / PIXELS_PER_CM;
+
+            const maxAbsHeightCm = 16;
+            const xCm = selectedObjectArrow.baseX / PIXELS_PER_CM;
+            const hCm = selectedObjectArrow.height / PIXELS_PER_CM;
+
+            return (
+              <div className="space-y-3">
+                <div>
+                  <div className="text-xs font-semibold mb-2">Poloha šipky (x): {formatCm(xCm)} cm</div>
+                  <Slider
+                    value={[xCm]}
+                    min={Math.floor(minXcm)}
+                    max={Math.ceil(maxXcm)}
+                    step={0.1}
+                    onValueChange={(value) => {
+                      const nextCm = value[0] ?? xCm;
+                      updateObjectArrowGeometry(selectedObjectArrow.id, { baseX: nextCm * PIXELS_PER_CM });
+                    }}
+                  />
+                </div>
+                <div>
+                  <div className="text-xs font-semibold mb-2">Výška šipky: {formatCm(hCm)} cm</div>
+                  <Slider
+                    value={[hCm]}
+                    min={-maxAbsHeightCm}
+                    max={maxAbsHeightCm}
+                    step={0.1}
+                    onValueChange={(value) => {
+                      const nextCm = value[0] ?? hCm;
+                      updateObjectArrowGeometry(selectedObjectArrow.id, { height: nextCm * PIXELS_PER_CM });
+                    }}
+                  />
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -9224,6 +9402,8 @@ export function FreeGeometryEditor({
           else if (activeTool === 'lineDashed' && selectedPointId) text = 'Vyber druhý bod čárkované přímky';
           else if (activeTool === 'lineDashDot' && selectedPointId) text = 'Vyber druhý bod čerchované přímky';
           else if (activeTool === 'ray' && selectedPointId) text = 'Vyber druhý bod polopřímky';
+          else if (activeTool === 'parallelAxis') text = 'Klikni na bod, kterým má procházet rovnoběžka s osou';
+          else if (activeTool === 'objectImagePlace') text = 'Klikni do plátna pro umístění šipky objekt/obraz (pod osou dolů, na/nahoru)';
           else if (activeTool === 'circle' && !isTabletMode && selectedPointId) text = 'Vyber bod na obvodu (poloměr)';
           else if (activeTool === 'angle' && !isTabletMode && selectedPointId) text = 'Vyber bod na rameni úhlu';
           if (text) content = <span>{text}</span>;
