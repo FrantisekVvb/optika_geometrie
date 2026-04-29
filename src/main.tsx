@@ -1,6 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { MantineProvider, createTheme } from "@mantine/core";
 import App from "./App.tsx";
+import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import "@mantine/core/styles.css";
 import "./index.css";
 import "./styles/tailwind-app.css";
@@ -13,7 +14,9 @@ const theme = createTheme({
 
 createRoot(document.getElementById("root")!).render(
   <MantineProvider theme={theme} defaultColorScheme="light">
-    <App />
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
   </MantineProvider>
 );
   
