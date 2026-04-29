@@ -1,0 +1,60 @@
+// Helper for handling tool menu clicks
+export const handleToolMenuClick = (
+  toolId: string,
+  setCircleInput: (fn: (prev: any) => any) => void,
+  setActiveTool: (tool: any) => void,
+  setSelectedPointId: (id: string | null) => void,
+  setActiveGroup: (id: string | null) => void,
+  setSegmentInput?: (fn: (prev: any) => any) => void,
+  setPerpTabletState?: (fn: (prev: any) => any) => void,
+  isTabletMode?: boolean,
+  setCircleTabletState?: (state: any) => void,
+  onInsertConvergingLens?: () => void,
+  onInsertDivergingLens?: () => void,
+  onInsertCurvedMirror?: () => void,
+  onInsertObjectImage?: () => void,
+) => {
+  if (toolId.startsWith('__popup__')) {
+    // Special popup triggers
+    if (toolId === '__popup__circle_fixed') {
+      setCircleInput(prev => ({ ...prev, visible: true, center: null, isDraggingCenter: false, isDraggingHandle: false }));
+      // Reset tablet circle state to avoid conflicts
+      if (setCircleTabletState) {
+        setCircleTabletState({ active: false, centerId: null, center: null, radius: 150, isDraggingHandle: false, handlePos: null });
+      }
+    } else if (toolId === '__popup__segment_fixed') {
+      if (setSegmentInput) {
+        setSegmentInput(prev => ({ ...prev, visible: true }));
+      }
+    }
+  } else if (toolId === '__action__insert_lens_converging') {
+    onInsertConvergingLens?.();
+  } else if (toolId === '__action__insert_lens_diverging') {
+    onInsertDivergingLens?.();
+  } else if (toolId === '__action__insert_curved_mirror') {
+    onInsertCurvedMirror?.();
+  } else if (toolId === '__action__insert_object_image') {
+    onInsertObjectImage?.();
+  } else {
+    setActiveTool(toolId);
+    
+    // Reset perpTabletState when switching tools
+    if (setPerpTabletState) {
+      setPerpTabletState({ step: 'idle', selectedLineId: null, currentPos: null });
+    }
+    
+    // Reset circleTabletState when switching tools
+    if (setCircleTabletState) {
+      setCircleTabletState({ active: false, centerId: null, center: null, radius: 150, isDraggingHandle: false, handlePos: null });
+    }
+    
+    // If switching to perpendicular in tablet mode, activate selectLine step
+    if (toolId === 'perpendicular' && isTabletMode) {
+      if (setPerpTabletState) {
+        setPerpTabletState({ step: 'selectLine', selectedLineId: null, currentPos: null });
+      }
+    }
+  }
+  setSelectedPointId(null);
+  setActiveGroup(null);
+};
