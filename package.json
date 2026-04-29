@@ -68,7 +68,7 @@
             "dev": "vite",
             "build": "node -e \"try{require('fs').rmSync('docs/assets',{recursive:true})}catch(e){}\" && vite build && node -e \"const fs=require('fs'); fs.copyFileSync('docs/rysovani-app/index.html','docs/rysovani-app/404.html'); fs.copyFileSync('docs/rysovani-app/index.html','docs/404.html')\"",
             "build:vividbooks": "npm run build",
-            "build:github-pages": "VITE_DEPLOY_BASE=/geometry-app/rysovani-app/ npm run build",
+            "build:github-pages": "VITE_DEPLOY_BASE=/optika_geometrie/rysovani-app/ npm run build",
             "build:gh-pages": "npm run build:github-pages",
             "predeploy": "npm run build",
             "deploy": "gh-pages -d docs"

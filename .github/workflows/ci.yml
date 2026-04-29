@@ -29,10 +29,11 @@ jobs:
 
       - run: npm ci
       # Vite vkládá VITE_* do bundlu při buildu – bez toho je Supabase v produkci „vypnuté“.
-      # Výchozí base = /rysovani-app/ (rysovani.vividbooks.com + GitHub Pages s vlastní doménou u kořene).
-      # Jen čisté github.io/REPO bez vlastní domény: npm run build:github-pages (base /geometry-app/rysovani-app/).
+      # GitHub Pages project site base:
+      #   https://<user>.github.io/optika_geometrie/rysovani-app/
       - run: npm run build
         env:
+          VITE_DEPLOY_BASE: /optika_geometrie/rysovani-app/
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
 
